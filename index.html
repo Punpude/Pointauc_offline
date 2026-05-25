@@ -7902,6 +7902,8 @@
         let cachedTerm = "";
         let cachedHideEliminated = false;
         let cachedEntriesCount = 0;
+        let cachedTotalPrice = 0;
+        let cachedEliminatedHash = 0;
         let ignoreHover = false;
         let scrollTimer = null;
         let hoverTimeout = null;
@@ -7997,11 +7999,16 @@
           const hideEliminated = DataManager.getHideEliminated();
           const entries = DataManager.getEntries();
 
-          // Проверяем, изменились ли условия кэширования
+          // Инвалидация кэша по цене и eliminated (не только по количеству)
+          const totalPrice = entries.reduce((s, e) => s + e.price, 0);
+          const eliminatedHash = entries.reduce((s, e) => s + (e.eliminated ? 1 : 0), 0);
+
           if (
             cachedIds !== null &&
             cachedHideEliminated === hideEliminated &&
-            cachedEntriesCount === entries.length
+            cachedEntriesCount === entries.length &&
+            cachedTotalPrice === totalPrice &&
+            cachedEliminatedHash === eliminatedHash
           ) {
             return cachedIds;
           }
@@ -8015,6 +8022,8 @@
           cachedIds = ids;
           cachedHideEliminated = hideEliminated;
           cachedEntriesCount = entries.length;
+          cachedTotalPrice = totalPrice;
+          cachedEliminatedHash = eliminatedHash;
           return ids;
         }
 
@@ -8091,9 +8100,9 @@
           if (scheduled) return;
           scheduled = true;
           requestAnimationFrame(() => {
+            scheduled = false;
             renderWindow(isFullRender);
           });
-          scheduled = false;
         }
 
         function update() {
@@ -8203,6 +8212,7 @@
         let cachedTerm = "";
         let cachedSortMode = "";
         let cachedEntriesCount = 0;
+        let cachedStateHash = 0;
         let spacer = null;
 
         function getVisibleOrderedIds() {
@@ -8213,12 +8223,15 @@
           const entries = DataManager.getEntries();
           const entriesCount = entries.length;
 
-          // Если кэш ещё актуален
+          // Учитываем изменения цен и eliminated (иначе кэш устаревает без перерисовки)
+          const stateHash = entries.reduce((s, e) => s + e.price + (e.eliminated ? 1 : 0), 0);
+
           if (
             cachedIds !== null &&
             term === cachedTerm &&
             sortMode === cachedSortMode &&
-            entriesCount === cachedEntriesCount
+            entriesCount === cachedEntriesCount &&
+            stateHash === cachedStateHash
           ) {
             return cachedIds;
           }
@@ -8236,6 +8249,7 @@
           cachedTerm = term;
           cachedSortMode = sortMode;
           cachedEntriesCount = entriesCount;
+          cachedStateHash = stateHash;
 
           return ids;
         }
@@ -8245,6 +8259,7 @@
           cachedTerm = "";
           cachedSortMode = "";
           cachedEntriesCount = 0;
+          cachedStateHash = 0;
         }
 
         function updateLotElementDataInDOM(
@@ -8289,11 +8304,15 @@
 
         // Взять элемент из пула (пустой div с абсолютным позиционированием)
         function acquireElement() {
-          if (pool.length > 0) {
+          while (pool.length > 0) {
             const el = pool.pop();
+            delete el.dataset._markedForRemoval;
             el.style.display = "";
             el.style.opacity = "";
             el.style.visibility = "";
+            el.style.transform = "";
+            el.style.transition = "";
+            el.classList.remove("lot-item--being-dragged", "lot-item--drag-over", "disappearing");
             return el;
           }
           const el = document.createElement("div");
@@ -8301,7 +8320,6 @@
           el.style.left = "0";
           el.style.width = "100%";
           el.style.boxSizing = "border-box";
-
           return el;
         }
 
@@ -8310,9 +8328,17 @@
           if (window.dragState && window.dragState.sourceId === id) return;
           const el = virtualItems.get(id);
           if (el) {
+            // Если элемент помечен к удалению или уже вне DOM — не кладём в пул
+            if (!el.isConnected || el.dataset._markedForRemoval === "1") {
+              virtualItems.delete(id);
+              return;
+            }
             el.style.display = "none";
             el.style.opacity = "";
             el.style.visibility = "";
+            el.style.transform = "";
+            el.style.transition = "";
+            el.classList.remove("lot-item--being-dragged", "lot-item--drag-over");
             pool.push(el);
             virtualItems.delete(id);
           }
@@ -8476,10 +8502,15 @@
 
                   const onTransitionEnd = () => {
                     el.style.transition = "";
-                    //el.style.opacity = "";
+                    el.style.opacity = "";
                     el.removeEventListener("transitionend", onTransitionEnd);
                   };
                   el.addEventListener("transitionend", onTransitionEnd);
+                  // Запасной сброс, если transitionend не сработает
+                  setTimeout(() => {
+                    el.style.transition = "";
+                    el.style.opacity = "";
+                  }, 500);
                 });
               }
             }
@@ -11504,24 +11535,12 @@
               ghostEl.remove();
               ghostEl = null;
             }
-            if (dragState.sourceElement) {
-              dragState.sourceElement.style.opacity = "1";
-              dragState.sourceElement.classList.remove(
-                "lot-item--being-dragged",
-              );
-            }
-
-            // Снимаем оба класса со всех элементов
-            document
-              .querySelectorAll(
-                ".lot-item--being-dragged, .lot-item--drag-over",
-              )
-              .forEach((el) =>
-                el.classList.remove(
-                  "lot-item--being-dragged",
-                  "lot-item--drag-over",
-                ),
-              );
+            // Сбрасываем opacity и классы у всех лотов (не только sourceElement,
+            // который мог уже быть удалён из DOM при merge)
+            document.querySelectorAll(".lot-item").forEach((el) => {
+              el.style.opacity = "";
+              el.classList.remove("lot-item--being-dragged", "lot-item--drag-over");
+            });
 
             dragState = null;
             stopAutoScroll();
@@ -11696,21 +11715,26 @@
           clone.style.transition = "none";
           clone.classList.add("disappearing");
 
+          // Помечаем оригинал, чтобы releaseElement не клал его в пул со state display:none
+          const _entryId = lotItem.dataset.id;
+          if (_entryId) lotItem.dataset._markedForRemoval = "1";
           lotItem.remove();
 
           document.body.appendChild(clone);
 
-          clone.addEventListener(
-            "animationend",
-            () => {
-              clone.remove();
-            },
-            { once: true },
-          );
+          // Запасной таймаут на случай, если animationend не сработает
+          const _timeoutId = setTimeout(() => {
+            if (clone && clone.isConnected) clone.remove();
+          }, 300);
+
+          clone.addEventListener("animationend", () => {
+            clearTimeout(_timeoutId);
+            if (clone && clone.isConnected) clone.remove();
+          }, { once: true });
         }
 
         function compareEntries(a, b, mode = AppState.currentSortMode) {
-          if (a.eliminated !== b.eliminated) return a.eliminated ? -1 : 1;
+          if (a.eliminated !== b.eliminated) return a.eliminated ? 1 : -1;
           switch (mode) {
             case "price-desc":
               if (b.price !== a.price) return b.price - a.price;
@@ -12600,9 +12624,18 @@
           document.body.appendChild(clone);
           lotItem.style.visibility = "hidden";
 
+          // Запасной таймаут: если animationend не сработает (вкладка неактивна и т.п.)
+          const _safeTimeout = setTimeout(() => {
+            clone.remove();
+            lotItem.style.visibility = "";
+            DataManager.deleteLot(entry.id);
+            WheelLogic.resetWinner();
+          }, 500);
+
           clone.addEventListener(
             "animationend",
             () => {
+              clearTimeout(_safeTimeout);
               clone.remove();
               lotItem.style.visibility = "";
               DataManager.deleteLot(entry.id);
